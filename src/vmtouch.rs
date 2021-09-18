@@ -1,10 +1,10 @@
 use log::warn;
+use nix::libc;
 use std::ffi::{c_void, CStr};
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::null_mut;
-use nix::libc;
 
 pub struct MemoryMap {
     file: File,
@@ -13,6 +13,27 @@ pub struct MemoryMap {
     mincore_array: *mut i8,
     page_size: usize,
     pages: usize,
+}
+
+#[derive(Debug)]
+pub struct MincoreStat {
+    page_size: usize,
+    total_pages: usize,
+    resident_pages: usize,
+}
+
+impl MincoreStat {
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    pub fn total_pages(&self) -> usize {
+        self.total_pages
+    }
+
+    pub fn resident_pages(&self) -> usize {
+        self.resident_pages
+    }
 }
 
 impl Drop for MemoryMap {
@@ -72,7 +93,9 @@ impl MemoryMap {
 
         let mincore = unsafe { libc::mincore(mmap, file_len, mincore_array) };
         if mincore != 0 {
-            unsafe { libc::free(mincore_array as *mut c_void); }
+            unsafe {
+                libc::free(mincore_array as *mut c_void);
+            }
             Self::_cleanup_mmap(mmap, file_len);
             return Err(Error::MincoreError);
         }
@@ -81,7 +104,7 @@ impl MemoryMap {
             file,
             len: file_len,
             mmap,
-            mincore_array: mincore_array,
+            mincore_array,
             page_size,
             pages,
         })
@@ -99,14 +122,16 @@ impl MemoryMap {
         }
     }
 
-    pub fn pages(&self) -> usize {
-        self.pages
-    }
-
-    pub fn resident_pages(&self) -> usize {
-        (0..self.pages)
+    pub fn resident_pages(&self) -> MincoreStat {
+        let resident_pages = (0..self.pages)
             .filter(|&i| (unsafe { self.mincore_array.add(i).read() }) & 0x1 != 0)
-            .count()
+            .count();
+
+        MincoreStat {
+            page_size: self.page_size,
+            total_pages: self.pages,
+            resident_pages,
+        }
     }
 
     pub fn touch(&mut self) {
@@ -121,11 +146,9 @@ impl MemoryMap {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub fn evict(&mut self) -> Result<()> {
         unsafe {
-            nix::sys::mman::msync(
-                self.mmap,
-                self.len,
-                nix::sys::mman::MsFlags::MS_INVALIDATE)
-        }.map_err(Error::NixError)
+            nix::sys::mman::msync(self.mmap, self.len, nix::sys::mman::MsFlags::MS_INVALIDATE)
+        }
+        .map_err(Error::NixError)
     }
 
     #[cfg(target_os = "linux")]

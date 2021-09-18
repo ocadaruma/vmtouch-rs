@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
-#[structopt(name = "vmtouch")]
+#[structopt(name = "vmtouch-rs")]
 struct Options {
     /// Target file
     #[structopt(short, long)]
@@ -34,10 +34,14 @@ fn main() {
             Command::Touch => mmap.touch(),
         },
         _ => {
+            let stat = mmap.resident_pages();
             println!(
-                "Resident pages: {}/{}",
-                mmap.resident_pages(),
-                mmap.pages()
+                "Resident pages: {}/{}  {}/{}  {}%",
+                stat.resident_pages(),
+                stat.total_pages(),
+                stat.resident_pages() * stat.page_size(),
+                stat.total_pages() * stat.page_size(),
+                stat.resident_pages() * 100 / stat.total_pages()
             );
         }
     }
