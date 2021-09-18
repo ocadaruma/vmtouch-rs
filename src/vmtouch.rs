@@ -4,6 +4,7 @@ use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::null_mut;
+use nix::libc;
 
 pub struct MemoryMap {
     file: File,
@@ -29,6 +30,7 @@ pub enum Error {
     MmapError,
     AllocError,
     MincoreError,
+    NixError(nix::Error),
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
@@ -61,18 +63,25 @@ impl MemoryMap {
 
         let pages = (file_len + page_size + 1) / page_size;
 
-        let mincore_array = unsafe { libc::malloc(pages) };
+        let mincore_array = unsafe { libc::malloc(pages) } as *mut i8;
 
         if mincore_array.is_null() {
             Self::_cleanup_mmap(mmap, file_len);
             return Err(Error::AllocError);
         }
 
+        let mincore = unsafe { libc::mincore(mmap, file_len, mincore_array) };
+        if mincore != 0 {
+            unsafe { libc::free(mincore_array as *mut c_void); }
+            Self::_cleanup_mmap(mmap, file_len);
+            return Err(Error::MincoreError);
+        }
+
         Ok(MemoryMap {
             file,
             len: file_len,
             mmap,
-            mincore_array: mincore_array as *mut i8,
+            mincore_array: mincore_array,
             page_size,
             pages,
         })
@@ -94,21 +103,32 @@ impl MemoryMap {
         self.pages
     }
 
-    pub fn resident_pages(&self) -> Result<usize> {
-        let mincore = unsafe { libc::mincore(self.mmap, self.len, self.mincore_array) };
-        if mincore != 0 {
-            return Err(Error::MincoreError);
+    pub fn resident_pages(&self) -> usize {
+        (0..self.pages)
+            .filter(|&i| (unsafe { self.mincore_array.add(i).read() }) & 0x1 != 0)
+            .count()
+    }
+
+    pub fn touch(&mut self) {
+        unsafe {
+            for i in 0..self.pages {
+                (self.mmap as *mut i8).add(i * self.page_size).read();
+                self.mincore_array.add(i).write(1);
+            }
         }
-
-        Ok((0..self.pages)
-            .filter(|&i| (unsafe { *(self.mincore_array.add(i)) }) & 0x1 != 0)
-            .count())
     }
 
-    pub fn touch(&mut self) -> Result<()> {
-        unimplemented!()
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    pub fn evict(&mut self) -> Result<()> {
+        unsafe {
+            nix::sys::mman::msync(
+                self.mmap,
+                self.len,
+                nix::sys::mman::MsFlags::MS_INVALIDATE)
+        }.map_err(Error::NixError)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn evict(&mut self) -> Result<()> {
         unimplemented!()
     }
