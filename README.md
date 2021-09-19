@@ -1,5 +1,7 @@
 # vmtouch-rs
 
+[![Build Status](https://github.com/ocadaruma/vmtouch-rs/workflows/CI/badge.svg?branch=master)](https://github.com/ocadaruma/vmtouch-rs/actions?query=workflow%3ACI+branch%3Amaster+event%3Apush)
+
 Rust-port of [vmtouch](https://github.com/hoytech/vmtouch).
 
 ## Usage
