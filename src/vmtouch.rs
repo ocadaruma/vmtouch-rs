@@ -1,16 +1,24 @@
 use log::warn;
 use nix::libc;
-use std::ffi::{c_void, CStr};
+use nix::sys::mman;
+use nix::unistd;
+use std::ffi::c_void;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::null_mut;
 
-pub struct MemoryMap {
+#[cfg(target_os = "linux")]
+type MincoreChar = u8;
+
+#[cfg(target_os = "macos")]
+type MincoreChar = i8;
+
+pub struct MappedFile {
     file: File,
     len: usize,
     mmap: *mut c_void,
-    mincore_array: *mut i8,
+    mincore_array: *mut MincoreChar,
     page_size: usize,
     pages: usize,
 }
@@ -36,7 +44,7 @@ impl MincoreStat {
     }
 }
 
-impl Drop for MemoryMap {
+impl Drop for MappedFile {
     fn drop(&mut self) {
         unsafe {
             libc::free(self.mincore_array as *mut c_void);
@@ -47,60 +55,59 @@ impl Drop for MemoryMap {
 
 #[derive(Debug)]
 pub enum Error {
-    IOError(std::io::Error),
-    MmapError,
-    AllocError,
-    MincoreError,
-    NixError(nix::Error),
+    IO(std::io::Error),
+    NotPageAligned,
+    AllocFailed,
+    Nix(nix::Error),
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-impl MemoryMap {
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<MemoryMap> {
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let file = File::open(path).map_err(Error::IOError)?;
-        let file_meta = file.metadata().map_err(Error::IOError)?;
+impl MappedFile {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<MappedFile> {
+        let page_size = unistd::sysconf(unistd::SysconfVar::PAGE_SIZE)
+            .ok()
+            .flatten()
+            .expect("Failed to get page size") as usize;
+        let file = File::open(path).map_err(Error::IO)?;
+        let file_meta = file.metadata().map_err(Error::IO)?;
         let file_len = file_meta.len() as usize;
 
         let mmap = unsafe {
-            libc::mmap(
+            mman::mmap(
                 null_mut(),
                 file_len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
+                mman::ProtFlags::PROT_READ,
+                mman::MapFlags::MAP_SHARED,
                 file.as_raw_fd(),
                 0,
             )
-        };
+        }
+        .map_err(Error::Nix)?;
 
-        if mmap == libc::MAP_FAILED ||
-            // check alignment
-            (mmap as i64 & (page_size - 1) as i64) != 0
-        {
+        if (mmap as i64 & (page_size - 1) as i64) != 0 {
             Self::_cleanup_mmap(mmap, file_len);
-            return Err(Error::MmapError);
+            return Err(Error::NotPageAligned);
         }
 
         let pages = (file_len + page_size + 1) / page_size;
 
-        let mincore_array = unsafe { libc::malloc(pages) } as *mut i8;
+        let mincore_array = unsafe { libc::malloc(pages) } as *mut MincoreChar;
 
         if mincore_array.is_null() {
             Self::_cleanup_mmap(mmap, file_len);
-            return Err(Error::AllocError);
+            return Err(Error::AllocFailed);
         }
 
-        let mincore = unsafe { libc::mincore(mmap, file_len, mincore_array) };
-        if mincore != 0 {
-            unsafe {
+        unsafe {
+            if let Err(err) = nix::Error::result(libc::mincore(mmap, file_len, mincore_array)) {
                 libc::free(mincore_array as *mut c_void);
+                Self::_cleanup_mmap(mmap, file_len);
+                return Err(Error::Nix(err));
             }
-            Self::_cleanup_mmap(mmap, file_len);
-            return Err(Error::MincoreError);
-        }
+        };
 
-        Ok(MemoryMap {
+        Ok(MappedFile {
             file,
             len: file_len,
             mmap,
@@ -112,12 +119,8 @@ impl MemoryMap {
 
     fn _cleanup_mmap(mmap: *mut c_void, len: usize) {
         unsafe {
-            let unmap = libc::munmap(mmap, len);
-            if unmap != 0 {
-                warn!(
-                    "failed to unmap. error: {:?}",
-                    CStr::from_ptr(libc::strerror(unmap))
-                );
+            if let Err(err) = mman::munmap(mmap, len) {
+                warn!("failed to unmap. error: {}", err.desc());
             }
         }
     }
@@ -143,16 +146,25 @@ impl MemoryMap {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[cfg(target_os = "macos")]
     pub fn evict(&mut self) -> Result<()> {
         unsafe {
             nix::sys::mman::msync(self.mmap, self.len, nix::sys::mman::MsFlags::MS_INVALIDATE)
         }
-        .map_err(Error::NixError)
+        .map_err(Error::Nix)
     }
 
     #[cfg(target_os = "linux")]
     pub fn evict(&mut self) -> Result<()> {
-        unimplemented!()
+        match nix::fcntl::posix_fadvise(
+            self.file.as_raw_fd(),
+            0,
+            self.len as i64,
+            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        ) {
+            Ok(ret) if ret == 0 => Ok(()),
+            Ok(ret) => Err(Error::Nix(nix::Error::from_i32(ret))),
+            Err(err) => Err(Error::Nix(err)),
+        }
     }
 }

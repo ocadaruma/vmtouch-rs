@@ -1,6 +1,6 @@
 mod vmtouch;
 
-use crate::vmtouch::MemoryMap;
+use crate::vmtouch::MappedFile;
 use env_logger::Env;
 use std::path::PathBuf;
 use structopt::StructOpt;
@@ -26,7 +26,7 @@ fn main() {
     env_logger::init_from_env(Env::default().default_filter_or("info"));
 
     let opt = Options::from_args();
-    let mut mmap = MemoryMap::open(opt.file).unwrap();
+    let mut mmap = MappedFile::open(opt.file).unwrap();
 
     match opt.cmd {
         Some(cmd) => match cmd {
