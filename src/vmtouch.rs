@@ -168,3 +168,32 @@ impl MappedFile {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_file_not_exist() {
+        let mmap = MappedFile::open("/__foo_bar_invalid__");
+        assert!(mmap.is_err());
+    }
+
+    #[test]
+    fn test_resident_pages() {
+        let mmap = MappedFile::open("/etc/hosts").unwrap();
+        assert!(mmap.resident_pages().resident_pages <= mmap.resident_pages().total_pages);
+    }
+
+    #[test]
+    fn test_touch() {
+        let mut mmap = MappedFile::open("/etc/hosts").unwrap();
+        mmap.touch();
+    }
+
+    #[test]
+    fn test_evict() {
+        let mut mmap = MappedFile::open("/etc/hosts").unwrap();
+        mmap.evict().unwrap();
+    }
+}
